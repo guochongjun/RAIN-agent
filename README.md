@@ -1,4 +1,4 @@
-# Hermes Desktop - Windows 桌面版
+# RAIN Agent - Windows 桌面版
 
 > 基于 Hermes Agent 核心，简化为 Windows 桌面 AI 聊天助手
 
