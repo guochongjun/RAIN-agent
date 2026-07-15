@@ -1,0 +1,21 @@
+# Hermes Desktop - Full dependencies
+PyQt5>=5.15
+openai>=1.0
+httpx>=0.28
+httpx-socks>=0.9
+pyyaml>=6.0
+ruamel.yaml>=0.18
+rich>=13
+jinja2>=3.1
+pydantic>=2.0
+tenacity>=8
+python-dotenv>=1.0
+certifi>=2024
+requests>=2.31
+prompt-toolkit>=3.0
+croniter>=3.0
+packaging>=24
+concurrent-log-handler>=0.9
+fire>=0.5
+websockets>=13
+PyQt5-sip>=12

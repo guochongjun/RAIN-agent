@@ -1,0 +1,1396 @@
+#!/usr/bin/env python3
+"""
+RAIN Desktop — Windows AI Assistant
+Integrates the RAIN agent engine with PyQt5 GUI.
+"""
+import sys
+import os
+import io
+import traceback
+import datetime
+from pathlib import Path
+
+# ── Crash logger (catches everything, writes to Desktop) ────
+_CRASH_LOG = Path(os.environ.get("USERPROFILE", ".")) / "Desktop" / "rain_crash.log"
+
+def _log_crash(msg):
+    try:
+        with open(_CRASH_LOG, "a", encoding="utf-8") as f:
+            f.write(f"[{datetime.datetime.now()}] {msg}\n")
+    except Exception:
+        pass
+
+# Fix: windowed PyInstaller has no console → stdout/stderr are None
+if sys.stdout is None:
+    sys.stdout = io.StringIO()
+if sys.stderr is None:
+    sys.stderr = io.StringIO()
+
+def _global_excepthook(exc_type, exc_val, exc_tb):
+    tb_text = "".join(traceback.format_exception(exc_type, exc_val, exc_tb))
+    _log_crash(f"UNHANDLED: {tb_text}")
+    # Also show message box if Qt is available
+    try:
+        from PyQt5.QtWidgets import QApplication, QMessageBox
+        if QApplication.instance():
+            QMessageBox.critical(None, "RAIN - 崩溃", f"程序遇到错误:\n\n{str(exc_val)}\n\n详情已写入:\n{_CRASH_LOG}")
+    except Exception:
+        pass
+    sys.__excepthook__(exc_type, exc_val, exc_tb)
+
+sys.excepthook = _global_excepthook
+
+import json
+import re
+import threading
+import time
+import traceback
+from pathlib import Path
+
+# ── Inject RAIN agent source path ─────────────────────────
+_HERMES_ROOT = Path(__file__).resolve().parent.parent
+if str(_HERMES_ROOT) not in sys.path:
+    sys.path.insert(0, str(_HERMES_ROOT))
+
+# ── RAIN bootstrap (UTF-8 on Windows) ─────────────────────
+try:
+    import hermes_bootstrap  # noqa: F401
+except ModuleNotFoundError:
+    pass
+
+# ── Qt ──────────────────────────────────────────────────────
+from PyQt5.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QTextEdit, QLineEdit, QPushButton, QLabel, QSplitter,
+    QDialog, QFormLayout, QDialogButtonBox, QMessageBox,
+    QMenuBar, QAction, QStatusBar, QFileDialog, QTabWidget,
+    QListWidget, QListWidgetItem, QPlainTextEdit, QProgressBar,
+    QComboBox, QCheckBox, QGroupBox, QScrollArea, QFrame,
+    QGridLayout, QSpinBox, QDoubleSpinBox
+)
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QSettings, QSize
+from PyQt5.QtGui import QFont, QTextCursor, QColor, QIcon, QPalette, QKeySequence
+
+# ── RAIN agent engine ─────────────────────────────────────
+try:
+    from run_agent import AIAgent
+    from hermes_state import SessionDB
+    from hermes_constants import get_hermes_home
+    from toolsets import get_toolset_names
+    import providers as _providers
+    HERMES_AVAILABLE = True
+except ImportError as e:
+    HERMES_AVAILABLE = False
+    _hermes_import_error = str(e)
+
+# ── Constants ───────────────────────────────────────────────
+APP_NAME = "RAIN"
+APP_VERSION = "2.0.0"
+SETTINGS_DIR = Path(os.environ.get("APPDATA", Path.home() / "AppData" / "Roaming")) / "RAIN"
+
+# ── Dark theme ──────────────────────────────────────────────
+DARK_STYLE = """
+QMainWindow, QDialog { background-color: #1e1e2e; color: #cdd6f4; }
+QTextEdit, QPlainTextEdit, QLineEdit, QListWidget, QComboBox {
+    background-color: #181825; color: #cdd6f4; border: 1px solid #313244;
+    border-radius: 6px; padding: 8px; font-family: "Segoe UI","Microsoft YaHei",sans-serif; font-size: 13px;
+}
+QTextEdit:focus, QPlainTextEdit:focus, QLineEdit:focus, QComboBox:focus { border: 1px solid #89b4fa; }
+QPushButton {
+    background-color: #45475a; color: #cdd6f4; border: none; border-radius: 6px;
+    padding: 8px 16px; font-weight: bold; font-size: 12px;
+}
+QPushButton:hover { background-color: #585b70; }
+QPushButton:pressed { background-color: #313244; }
+QPushButton#sendBtn { background-color: #89b4fa; color: #1e1e2e; }
+QPushButton#sendBtn:hover { background-color: #b4befe; }
+QPushButton#stopBtn { background-color: #f38ba8; color: #1e1e2e; }
+QPushButton#stopBtn:hover { background-color: #fab387; }
+QLabel { color: #a6adc8; font-size: 12px; }
+QStatusBar { background-color: #11111b; color: #a6adc8; }
+QMenuBar { background-color: #11111b; color: #cdd6f4; }
+QMenuBar::item:selected { background-color: #313244; }
+QMenu { background-color: #1e1e2e; color: #cdd6f4; border: 1px solid #313244; }
+QMenu::item:selected { background-color: #45475a; }
+QSplitter::handle { background-color: #313244; width: 2px; }
+QTabWidget::pane { border: 1px solid #313244; background-color: #1e1e2e; }
+QTabBar::tab { background-color: #181825; color: #a6adc8; padding: 6px 16px; border: 1px solid #313244; border-bottom: none; }
+QTabBar::tab:selected { background-color: #1e1e2e; color: #89b4fa; }
+QProgressBar { border: none; background-color: #313244; border-radius: 3px; height: 4px; }
+QProgressBar::chunk { background-color: #89b4fa; border-radius: 3px; }
+QGroupBox { border: 1px solid #313244; border-radius: 6px; margin-top: 8px; padding-top: 16px; color: #cdd6f4; font-weight: bold; }
+QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px; }
+QCheckBox { color: #cdd6f4; spacing: 8px; }
+QCheckBox::indicator { width: 16px; height: 16px; border: 1px solid #45475a; border-radius: 3px; background: #181825; }
+QCheckBox::indicator:checked { background: #89b4fa; border-color: #89b4fa; }
+QSpinBox, QDoubleSpinBox {
+    background-color: #181825; color: #cdd6f4; border: 1px solid #313244;
+    border-radius: 4px; padding: 4px 8px;
+}
+QScrollArea { border: none; background: transparent; }
+QComboBox { min-width: 120px; }
+QComboBox QAbstractItemView {
+    background-color: #1e1e2e; color: #cdd6f4; border: 1px solid #313244; selection-background-color: #45475a;
+}
+"""
+
+
+# ── Settings Manager ────────────────────────────────────────
+class Settings:
+    DEFAULTS = {
+        "provider": "openai",
+        "api_key": "",
+        "base_url": "https://api.openai.com/v1",
+        "model": "gpt-4o",
+        "system_prompt": "你好，我叫RAIN，由江西磐拓智能科技有限公司开发的一款智能AI助手。我的目标是在各类任务中为你提供高效、精准的帮助——无论是回答问题、编写代码、分析信息，还是执行具体操作。有什么可以帮你的？😊",
+        "max_iterations": 25,
+        "max_tokens": 4096,
+        "temperature": 0.7,
+        "auto_scroll": True,
+        "window_x": 100, "window_y": 100,
+        "window_w": 1100, "window_h": 750,
+        "enabled_toolsets": "all",
+        "workspace_dir": "",
+        # Additional provider keys
+        "openrouter_key": "",
+        "deepseek_key": "",
+        "dashscope_key": "",
+        "google_key": "",
+        "anthropic_key": "",
+    }
+
+    def __init__(self, username=""):
+        self._username = username
+        self._data = dict(self.DEFAULTS)
+        self.load()
+
+    def _file(self):
+        d = SETTINGS_DIR / (self._username or "default")
+        d.mkdir(parents=True, exist_ok=True)
+        return d / "settings.json"
+
+    def switch_user(self, username):
+        """Switch to a different user's settings file."""
+        self.save()
+        self._username = username
+        self._data = dict(self.DEFAULTS)
+        self.load()
+
+    def load(self):
+        try:
+            f = self._file()
+            if f.exists():
+                self._data.update(json.loads(f.read_text(encoding="utf-8")))
+        except Exception:
+            pass
+
+    def save(self):
+        try:
+            self._file().write_text(json.dumps(self._data, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception as e:
+            import traceback
+            _log_crash(f"Settings save failed: {e}\n{traceback.format_exc()}")
+
+    def get(self, key, default=None):
+        return self._data.get(key, self.DEFAULTS.get(key, default))
+
+    def set(self, key, value):
+        self._data[key] = value
+        self.save()
+
+    def all(self):
+        return dict(self._data)
+
+
+settings = Settings()
+
+
+# ── Permission Checker ──────────────────────────────────────
+class PermissionChecker:
+    """Three-tier permission model:
+    1. Inside workspace: ALL operations allowed, no auth
+    2. Outside workspace, READ: allowed, no auth
+    3. Outside workspace, WRITE/DELETE: require authorization
+    """
+    def __init__(self, get_workspace):
+        self._get_ws = get_workspace
+        self._approve_all = set()        # paths approved for entire session
+        self._event = threading.Event()
+        self._result = False
+        self._current_tool = ""
+        self._current_paths = ""
+        self._current_op = ""
+        self.request = None              # pyqtSignal(str, str) — (tool, paths_desc)
+        self.locked_down = False         # when True, deny all without asking
+
+    def _resolve_ws(self):
+        ws = self._get_ws()
+        if not ws:
+            ws = str(Path(sys.executable).parent if getattr(sys, 'frozen', False) else Path.cwd())
+        return ws
+
+    def is_inside_workspace(self, path):
+        """Check if a path is inside the workspace."""
+        if not path:
+            return True
+        ws = self._resolve_ws()
+        if not ws:
+            return True
+        try:
+            Path(path).resolve().relative_to(Path(ws).resolve())
+            return True
+        except (ValueError, OSError):
+            return False
+
+    def check_read(self, tool_name, *paths):
+        """Read operations: always allowed (even outside workspace)."""
+        if self.locked_down:
+            return False
+        return True  # Read is always permitted
+
+    def check_write(self, tool_name, *paths):
+        """Write/delete operations: workspace=allowed, external=auth required."""
+        if self.locked_down:
+            return False
+        ws_r = Path(self._resolve_ws()).resolve()
+
+        outside = []
+        for p in paths:
+            if not p:
+                continue
+            try:
+                Path(p).resolve().relative_to(ws_r)
+            except (ValueError, OSError):
+                if p not in self._approve_all:
+                    outside.append(str(p))
+
+        if not outside:
+            return True  # All paths inside workspace
+
+        # External write — ask user
+        self._current_tool = tool_name
+        self._current_op = "write"
+        self._current_paths = "\n".join(outside)
+        self._result = False
+        self._event.clear()
+        if self.request:
+            self.request.emit(tool_name, self._current_paths)
+        self._event.wait(timeout=60)
+        return self._result
+
+    def grant(self, approve_all=False):
+        if approve_all:
+            for p in self._current_paths.split("\n"):
+                self._approve_all.add(p)
+        self._result = True
+        self._event.set()
+
+    def deny(self):
+        self._result = False
+        self.locked_down = True   # stop all further attempts
+        self._event.set()
+
+    def reset(self):
+        self._approve_all.clear()
+        self.locked_down = False
+
+# Module-level instance (patched after login)
+perm_checker = PermissionChecker(lambda: settings.get("workspace_dir", ""))
+
+# ── Agent Worker Thread ─────────────────────────────────────
+class RAINWorker(QThread):
+    """Runs the full RAIN AIAgent in a background thread."""
+    response_chunk = pyqtSignal(str)       # streaming text
+    thinking = pyqtSignal(str)             # thinking/reasoning
+    tool_start = pyqtSignal(str, str)      # name, args_json
+    tool_complete = pyqtSignal(str, str)   # name, result
+    tool_progress = pyqtSignal(str, str)   # name, status
+    status_msg = pyqtSignal(str)           # status bar
+    notice = pyqtSignal(str)               # notices
+    finished = pyqtSignal(str, dict)       # final_response, metadata
+    error = pyqtSignal(str)
+    perm_request = pyqtSignal(str, str)    # (tool_name, paths_desc) for permission dialog
+
+    def __init__(self, message, history=None, provider_config=None):
+        super().__init__()
+        self.message = message
+        self.history = history or []
+        self.provider_config = provider_config or {}
+        self._stop = threading.Event()
+
+    def stop(self):
+        self._stop.set()
+
+    def run(self):
+        if not HERMES_AVAILABLE:
+            self.error.emit(f"RAIN引擎不可用: {_hermes_import_error}")
+            return
+
+        try:
+            # ── Switch to workspace directory ──
+            ws = settings.get("workspace_dir", "")
+            if ws and os.path.isdir(ws):
+                os.chdir(ws)
+                self.status_msg.emit(f"工作目录: {ws}（内部操作无需授权）")
+            else:
+                import sys as _sys
+                ws = str(Path(_sys.executable).parent if getattr(_sys, 'frozen', False) else Path.cwd())
+                self.status_msg.emit(f"工作目录(默认): {ws}（内部操作无需授权）")
+
+            # ── Patch tools with permission checks ──
+            if HERMES_AVAILABLE:
+                try:
+                    import tools.file_tools as _ft
+                    import tools.terminal_tool as _tt
+                    import tools.browser_tool as _bt
+                    _orig_read = _ft.read_file_tool
+                    _orig_write = _ft.write_file_tool
+                    _orig_terminal = _tt.terminal_tool
+                    _orig_browser_nav = _bt.browser_navigate
+                    _orig_files_search = getattr(_ft, 'search_files_tool', None)
+                    _orig_patch = getattr(_ft, 'patch_tool', None)
+
+                    # ── READ ops: always allowed (even outside workspace) ──
+                    def _safe_read(*args, **kwargs):
+                        return _orig_read(*args, **kwargs)
+
+                    def _safe_search(*args, **kwargs):
+                        return _orig_files_search(*args, **kwargs) if _orig_files_search else None
+
+                    def _safe_browser_nav(*args, **kwargs):
+                        return _orig_browser_nav(*args, **kwargs)
+
+                    # ── WRITE ops: workspace=free, external=auth ──
+                    def _safe_write(*args, **kwargs):
+                        path = kwargs.get('path', args[0] if args else '')
+                        if not perm_checker.check_write("write_file", path):
+                            raise PermissionError("权限被拒绝：不允许写入工作目录外的文件，请点击允许")
+                        return _orig_write(*args, **kwargs)
+
+                    def _safe_patch(*args, **kwargs):
+                        path = kwargs.get('path', args[0] if args else '')
+                        if not perm_checker.check_write("patch", path):
+                            raise PermissionError("权限被拒绝：不允许修改工作目录外的文件，请点击允许")
+                        return _orig_patch(*args, **kwargs) if _orig_patch else None
+
+                    def _safe_terminal(*args, **kwargs):
+                        wd = kwargs.get('workdir', '')
+                        cmd = args[0] if args else kwargs.get('command', '')
+                        paths_to_check = []
+                        if wd:
+                            paths_to_check.append(wd)
+                        if cmd:
+                            import re as _re
+                            paths_in_cmd = _re.findall(r'[A-Za-z]:[\\/]\S+', cmd)
+                            paths_to_check.extend(paths_in_cmd)
+                        if paths_to_check:
+                            if not perm_checker.check_write("terminal", *paths_to_check):
+                                raise PermissionError("权限被拒绝：命令涉及工作目录外的路径，请点击允许")
+                        return _orig_terminal(*args, **kwargs)
+
+                    _ft.read_file_tool = _safe_read
+                    _ft.write_file_tool = _safe_write
+                    _tt.terminal_tool = _safe_terminal
+                    _bt.browser_navigate = _safe_browser_nav
+                    if _orig_files_search:
+                        _ft.search_files_tool = _safe_search
+                    if _orig_patch:
+                        _ft.patch_tool = _safe_patch
+
+                    # ── Patch execute_code — treat as write (can do anything) ──
+                    import tools.code_execution_tool as _cet
+                    _orig_exec = _cet.execute_code
+
+                    def _safe_exec(*args, **kwargs):
+                        if perm_checker.locked_down:
+                            raise PermissionError("权限被拒绝：用户已停止所有操作")
+                        code_str = kwargs.get('code', args[0] if args else '')
+                        if code_str:
+                            import re as _re2
+                            write_patterns = _re2.findall(
+                                r'(?:write_file|open\s*\(\s*["\']([^"\']+)["\']\s*,\s*["\']w)',
+                                code_str
+                            )
+                            abs_paths = _re2.findall(
+                                r'(?:path\s*=|write_file|open|mkdir|makedirs|remove|rmdir|unlink)\s*\(?\s*["\']([A-Za-z]:[\\/][^"\']+)',
+                                code_str
+                            )
+                            for p in set(write_patterns + abs_paths):
+                                if not perm_checker.check_write("execute_code", p):
+                                    raise PermissionError("权限被拒绝：代码尝试写入工作目录外的文件，请点击允许")
+                        return _orig_exec(*args, **kwargs)
+
+                    _cet.execute_code = _safe_exec
+                    self.status_msg.emit('代码执行已受权限监控')
+
+                    self.status_msg.emit('权限已生效: 工作目录内全权限，外部读允许，外部写需授权')
+                except Exception as e:
+                    self.status_msg.emit(f'权限补丁失败: {e}')
+
+            # ── Build the agent ──
+            provider = settings.get("provider", "openai")
+            cfg = self.provider_config
+
+            # Write SOUL.md with RAIN identity so it replaces DEFAULT_AGENT_IDENTITY
+            # (load_soul_md reads from get_hermes_home() / "SOUL.md")
+            _system_prompt = settings.get("system_prompt")
+            if _system_prompt:
+                try:
+                    if HERMES_AVAILABLE:
+                        _hermes_home = get_hermes_home()
+                        _hermes_home.mkdir(parents=True, exist_ok=True)
+                        (_hermes_home / "SOUL.md").write_text(_system_prompt, encoding="utf-8")
+                except Exception:
+                    pass
+
+            agent = AIAgent(
+                base_url=cfg.get("base_url") or settings.get("base_url"),
+                api_key=cfg.get("api_key") or settings.get("api_key"),
+                provider=provider,
+                model=settings.get("model"),
+                max_iterations=settings.get("max_iterations", 25),
+                enabled_toolsets=_parse_toolsets(settings.get("enabled_toolsets", "all")),
+                quiet_mode=False,
+                skip_context_files=True,
+                load_soul_identity=True,
+                skip_memory=False,
+                ephemeral_system_prompt=settings.get("system_prompt"),
+                # Callbacks for UI integration
+                stream_delta_callback=lambda t: self.response_chunk.emit(t),
+                tool_start_callback=lambda n, a, **kw: self.tool_start.emit(n, json.dumps(a, ensure_ascii=False) if isinstance(a, dict) else str(a)),
+                tool_complete_callback=lambda n, r, **kw: self.tool_complete.emit(n, _safe_str(r)[:5000]),
+                tool_progress_callback=lambda n, s: self.tool_progress.emit(n, _safe_str(s)),
+                thinking_callback=lambda t: self.thinking.emit(t),
+                status_callback=lambda t: self.status_msg.emit(t),
+                notice_callback=lambda t: self.notice.emit(t),
+                step_callback=lambda info: self.status_msg.emit(f"Step {info.get('step','?')}"),
+            )
+
+            # ── Run conversation with RAIN system prompt ──
+            # Appending workspace reminder so AI defaults to workspace directory
+            _sysmsg = settings.get("system_prompt") or ""
+            if ws:
+                _sysmsg += f"\n\n【工作目录规则】你当前的工作目录是: {ws}。"
+                _sysmsg += "所有文件操作(读、写、创建、搜索)默认在此目录中进行，除非用户明确指定了其他路径。"
+                _sysmsg += "用户说'创建文件'、'保存到桌面'等模糊指令时，优先使用工作目录，不要使用桌面或系统目录。"
+            result = agent.run_conversation(
+                self.message,
+                system_message=_sysmsg,
+            )
+            self.finished.emit(result.get("final_response", "") or "", {})
+
+        except Exception as e:
+            tb = traceback.format_exc()
+            self.error.emit(f"{e}\n\n{tb[-500:]}")
+
+
+def _parse_toolsets(val):
+    if not val or val == "all":
+        return None  # AIAgent uses None to mean "all default toolsets"
+    return [t.strip() for t in val.split(",") if t.strip()]
+
+
+def _safe_str(obj):
+    if obj is None:
+        return ""
+    if isinstance(obj, str):
+        return obj
+    try:
+        return json.dumps(obj, ensure_ascii=False, indent=2)
+    except Exception:
+        return str(obj)
+
+
+# ── Login Dialog ────────────────────────────────────────────
+class LoginDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("RAIN - 登录")
+        self.setFixedSize(380, 300)
+        self.setStyleSheet(DARK_STYLE)
+        self.username = ""
+        layout = QVBoxLayout(self)
+        layout.setSpacing(12)
+
+        title = QLabel("🔐 欢迎使用 RAIN")
+        title.setStyleSheet("font-size:18px; font-weight:bold; color:#89b4fa;")
+        title.setAlignment(Qt.AlignCenter)
+        layout.addWidget(title)
+
+        self.stack = QTabWidget()
+        # Login tab
+        lt = QWidget()
+        ltl = QFormLayout(lt)
+        ltl.setSpacing(10)
+        self.login_user = QLineEdit()
+        self.login_user.setPlaceholderText("用户名")
+        ltl.addRow("用户名:", self.login_user)
+        self.login_pass = QLineEdit()
+        self.login_pass.setEchoMode(QLineEdit.Password)
+        self.login_pass.setPlaceholderText("密码")
+        self.login_pass.returnPressed.connect(self._do_login)
+        ltl.addRow("密码:", self.login_pass)
+
+        self.remember_check = QCheckBox("记住我，下次自动登录")
+        self.remember_check.setChecked(True)  # 默认勾选
+        ltl.addRow("", self.remember_check)
+
+        self.stack.addTab(lt, "登录")
+
+        # Register tab
+        rt = QWidget()
+        rtl = QFormLayout(rt)
+        rtl.setSpacing(10)
+        self.reg_user = QLineEdit()
+        self.reg_user.setPlaceholderText("设置用户名")
+        rtl.addRow("用户名:", self.reg_user)
+        self.reg_pass = QLineEdit()
+        self.reg_pass.setEchoMode(QLineEdit.Password)
+        self.reg_pass.setPlaceholderText("设置密码")
+        rtl.addRow("密码:", self.reg_pass)
+        self.reg_pass2 = QLineEdit()
+        self.reg_pass2.setEchoMode(QLineEdit.Password)
+        self.reg_pass2.setPlaceholderText("确认密码")
+        self.reg_pass2.returnPressed.connect(self._do_register)
+        rtl.addRow("确认:", self.reg_pass2)
+        self.stack.addTab(rt, "注册")
+
+        layout.addWidget(self.stack)
+
+        self.msg_label = QLabel("")
+        self.msg_label.setStyleSheet("color:#f38ba8; font-size:11px;")
+        self.msg_label.setAlignment(Qt.AlignCenter)
+        layout.addWidget(self.msg_label)
+
+        btn_row = QHBoxLayout()
+        self.login_btn = QPushButton("登录")
+        self.login_btn.setObjectName("sendBtn")
+        self.login_btn.clicked.connect(self._do_login)
+        btn_row.addWidget(self.login_btn)
+
+        self.reg_btn = QPushButton("注册")
+        self.reg_btn.setObjectName("sendBtn")
+        self.reg_btn.clicked.connect(self._do_register)
+        self.reg_btn.hide()
+        btn_row.addWidget(self.reg_btn)
+        layout.addLayout(btn_row)
+
+        self.stack.currentChanged.connect(lambda i: self._toggle_btn(i))
+        self._init_user_db()
+
+    def _init_user_db(self):
+        import sqlite3, hashlib
+        dbp = SETTINGS_DIR / "users.db"
+        self._udb = sqlite3.connect(str(dbp))
+        self._udb.execute("""CREATE TABLE IF NOT EXISTS users (
+            username TEXT PRIMARY KEY, password TEXT, created_at TEXT
+        )""")
+        self._udb.commit()
+
+    def _toggle_btn(self, idx):
+        self.login_btn.setVisible(idx == 0)
+        self.reg_btn.setVisible(idx == 1)
+        self.msg_label.setText("")
+
+    def _hash(self, pw):
+        import hashlib
+        return hashlib.sha256(f"RAIN_SALT_{pw}".encode()).hexdigest()
+
+    def _do_login(self):
+        u = self.login_user.text().strip()
+        p = self.login_pass.text().strip()
+        if not u or not p:
+            self.msg_label.setText("请输入用户名和密码")
+            return
+        row = self._udb.execute("SELECT password FROM users WHERE username=?", (u,)).fetchone()
+        if not row:
+            self.msg_label.setText("用户不存在，请先注册")
+            return
+        if row[0] != self._hash(p):
+            self.msg_label.setText("密码错误")
+            return
+        self.username = u
+        # 记住我：存到独立文件（不受 switch_user 影响）
+        remember_file = SETTINGS_DIR / "remember.json"
+        if self.remember_check.isChecked():
+            try:
+                remember_file.write_text(json.dumps({
+                    "user": u, "pass_hash": row[0]
+                }), encoding="utf-8")
+            except Exception:
+                pass
+        else:
+            try:
+                remember_file.unlink(missing_ok=True)
+            except Exception:
+                pass
+        self.accept()
+
+    def _do_register(self):
+        u = self.reg_user.text().strip()
+        p = self.reg_pass.text().strip()
+        p2 = self.reg_pass2.text().strip()
+        if not u or not p:
+            self.msg_label.setText("请填写完整信息")
+            return
+        if len(u) < 2:
+            self.msg_label.setText("用户名至少2个字符")
+            return
+        if len(p) < 4:
+            self.msg_label.setText("密码至少4个字符")
+            return
+        if p != p2:
+            self.msg_label.setText("两次密码不一致")
+            return
+        row = self._udb.execute("SELECT 1 FROM users WHERE username=?", (u,)).fetchone()
+        if row:
+            self.msg_label.setText("用户名已存在")
+            return
+        import datetime
+        self._udb.execute("INSERT INTO users VALUES (?,?,?)",
+            (u, self._hash(p), datetime.datetime.now().isoformat()))
+        self._udb.commit()
+        self.username = u
+        self.accept()
+
+# ── Settings Dialog ─────────────────────────────────────────
+class SettingsDialog(QDialog):
+    PROVIDERS = [
+        ("openai", "OpenAI", "https://api.openai.com/v1"),
+        ("openrouter", "OpenRouter", "https://openrouter.ai/api/v1"),
+        ("deepseek", "DeepSeek", "https://api.deepseek.com/v1"),
+        ("dashscope", "通义千问 (DashScope)", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
+        ("google", "Google Gemini", "https://generativelanguage.googleapis.com/v1beta/openai"),
+        ("anthropic", "Anthropic", "https://api.anthropic.com/v1"),
+    ]
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("RAIN 设置")
+        self.setMinimumSize(550, 580)
+        self.setStyleSheet(DARK_STYLE)
+
+        layout = QVBoxLayout(self)
+        tabs = QTabWidget()
+
+        # ── Tab 1: Provider & Model ──
+        t1 = QWidget()
+        t1l = QFormLayout(t1)
+        t1l.setSpacing(8)
+
+        self.provider_combo = QComboBox()
+        for pid, pname, _ in self.PROVIDERS:
+            self.provider_combo.addItem(pname, pid)
+        idx = self.provider_combo.findData(settings.get("provider"))
+        if idx >= 0:
+            self.provider_combo.setCurrentIndex(idx)
+        self.provider_combo.currentIndexChanged.connect(self._on_provider_changed)
+        t1l.addRow("AI服务商:", self.provider_combo)
+
+        self.api_key_input = QLineEdit()
+        self.api_key_input.setEchoMode(QLineEdit.Password)
+        self.api_key_input.setPlaceholderText("sk-...")
+        t1l.addRow("API Key:", self.api_key_input)
+
+        self.base_url_input = QLineEdit()
+        self.base_url_input.setPlaceholderText("https://api.openai.com/v1")
+        t1l.addRow("API Base URL:", self.base_url_input)
+
+        self.model_input = QLineEdit()
+        self.model_input.setPlaceholderText("gpt-4o / claude-sonnet-4 / deepseek-chat")
+        t1l.addRow("模型名:", self.model_input)
+
+        self._on_provider_changed()
+        tabs.addTab(t1, "API设置")
+
+        # ── Tab 2: Agent Params ──
+        t2 = QWidget()
+        t2l = QFormLayout(t2)
+        t2l.setSpacing(8)
+
+        self.max_iter = QSpinBox()
+        self.max_iter.setRange(1, 100)
+        self.max_iter.setValue(settings.get("max_iterations"))
+        t2l.addRow("最大工具调用轮数:", self.max_iter)
+
+        self.max_tokens = QSpinBox()
+        self.max_tokens.setRange(256, 128000)
+        self.max_tokens.setValue(settings.get("max_tokens"))
+        t2l.addRow("Max Tokens:", self.max_tokens)
+
+        self.temp = QDoubleSpinBox()
+        self.temp.setRange(0, 2.0)
+        self.temp.setSingleStep(0.1)
+        self.temp.setValue(settings.get("temperature"))
+        t2l.addRow("Temperature:", self.temp)
+
+        tabs.addTab(t2, "模型参数")
+
+        # ── Tab 3: Tools ──
+        t3 = QWidget()
+        t3l = QVBoxLayout(t3)
+        self.tools_combo = QComboBox()
+        self.tools_combo.addItem("全部工具 (推荐)", "all")
+        self.tools_combo.addItem("仅聊天 (无工具)", "none")
+        self.tools_combo.addItem("安全模式 (只读)", "safe")
+        self.tools_combo.addItem("开发模式 (terminal+file)", "development")
+        self.tools_combo.addItem("研究模式 (web+vision)", "research")
+        idx = self.tools_combo.findData(settings.get("enabled_toolsets"))
+        if idx >= 0:
+            self.tools_combo.setCurrentIndex(idx)
+        t3l.addWidget(QLabel("选择工具集:"))
+        t3l.addWidget(self.tools_combo)
+        t3l.addStretch()
+        tabs.addTab(t3, "工具")
+
+        # ── Tab 4: Workspace ──
+        t5 = QWidget()
+        t5l = QFormLayout(t5)
+        t5l.setSpacing(8)
+        wh = QHBoxLayout()
+        self.workspace_input = QLineEdit()
+        self.workspace_input.setPlaceholderText("留空使用EXE所在目录，或选择一个目录...")
+        self.workspace_input.setText(settings.get("workspace_dir", ""))
+        wh.addWidget(self.workspace_input)
+        browse_btn = QPushButton("浏览...")
+        browse_btn.clicked.connect(self._browse_workspace)
+        wh.addWidget(browse_btn)
+        t5l.addRow("工作目录:", wh)
+        t5l.addRow(QLabel("skills、脚本等文件放在此目录，AI可完全读写。留空=EXE目录"))
+        tabs.addTab(t5, "工作目录")
+
+        # ── Tab 5: System Prompt ──
+        t4 = QWidget()
+        t4l = QVBoxLayout(t4)
+        self.sys_prompt = QPlainTextEdit()
+        self.sys_prompt.setPlainText(settings.get("system_prompt"))
+        self.sys_prompt.setPlaceholderText("系统提示词...")
+        t4l.addWidget(self.sys_prompt)
+        tabs.addTab(t4, "系统提示词")
+
+        layout.addWidget(tabs)
+
+        # Buttons
+        btn = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btn.accepted.connect(self._save)
+        btn.rejected.connect(self.reject)
+        layout.addWidget(btn)
+
+    def _on_provider_changed(self):
+        pid = self.provider_combo.currentData()
+        # Restore saved values for this provider
+        self.api_key_input.setText(settings.get(f"{pid}_key", "") or settings.get("api_key", ""))
+        for pvid, _, url in self.PROVIDERS:
+            if pvid == pid:
+                saved_url = settings.get("base_url", "")
+                self.base_url_input.setText(saved_url if saved_url and saved_url != "https://api.openai.com/v1" else url)
+                break
+        self.model_input.setText(settings.get("model", ""))
+
+    def _save(self):
+        pid = self.provider_combo.currentData()
+        settings.set("provider", pid)
+        settings.set("api_key", self.api_key_input.text().strip())
+        settings.set(f"{pid}_key", self.api_key_input.text().strip())
+        settings.set("base_url", self.base_url_input.text().strip())
+        settings.set("model", self.model_input.text().strip())
+        settings.set("max_iterations", self.max_iter.value())
+        settings.set("max_tokens", self.max_tokens.value())
+        settings.set("temperature", self.temp.value())
+        settings.set("enabled_toolsets", self.tools_combo.currentData())
+        settings.set("system_prompt", self.sys_prompt.toPlainText().strip())
+        settings.set("workspace_dir", self.workspace_input.text().strip())
+        self.accept()
+
+    def _browse_workspace(self):
+        from PyQt5.QtWidgets import QFileDialog
+        d = QFileDialog.getExistingDirectory(self, "选择工作目录", self.workspace_input.text() or os.path.expanduser("~"))
+        if d:
+            self.workspace_input.setText(d)
+
+
+# ── Main Window ─────────────────────────────────────────────
+class MainWindow(QMainWindow):
+    def __init__(self, username=""):
+        super().__init__()
+        self.username = username
+        self.setWindowTitle(f"{APP_NAME} v{APP_VERSION} - {username}" if username else f"{APP_NAME} v{APP_VERSION}")
+        self.setMinimumSize(700, 450)
+        self.resize(settings.get("window_w"), settings.get("window_h"))
+        self.move(settings.get("window_x"), settings.get("window_y"))
+
+        self.worker: RAINWorker = None
+        self._response_buffer = ""
+        self._assistant_block_started = False
+        self._current_tool_block = ""
+        self.current_sid = None
+
+        self._build_ui()
+        self._build_menu()
+        self._build_statusbar()
+        self._init_db()
+        self._refresh_sessions()
+        # Auto-start a new session or resume last one
+        self._new_session()
+
+    def _build_ui(self):
+        central = QWidget()
+        self.setCentralWidget(central)
+        ml = QHBoxLayout(central)
+        ml.setContentsMargins(4, 4, 4, 4)
+        ml.setSpacing(4)
+
+        # ── Left panel: Sessions + Info ──
+        left = QWidget()
+        left.setFixedWidth(180)
+        ll = QVBoxLayout(left)
+        ll.setContentsMargins(0, 0, 0, 0)
+
+        ll.addWidget(QLabel("📋 对话历史"))
+        self.session_list = QListWidget()
+        self.session_list.itemClicked.connect(self._on_session_click)
+        self.session_list.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.session_list.customContextMenuRequested.connect(self._on_session_right_click)
+        ll.addWidget(self.session_list)
+
+        new_btn = QPushButton("+ 新对话")
+        new_btn.clicked.connect(self._new_session)
+        ll.addWidget(new_btn)
+
+        # Status indicators
+        self.engine_label = QLabel()
+        self.engine_label.setWordWrap(True)
+        self.engine_label.setStyleSheet("color:#a6adc8; font-size:10px; padding:4px;")
+        self._update_engine_label()
+        ll.addWidget(self.engine_label)
+
+        ml.addWidget(left)
+
+        # ── Right: Chat Area ──
+        right = QWidget()
+        rl = QVBoxLayout(right)
+        rl.setContentsMargins(0, 0, 0, 0)
+        rl.setSpacing(4)
+
+        self.chat_display = QTextEdit()
+        self.chat_display.setReadOnly(True)
+        self.chat_display.setFont(QFont("Microsoft YaHei", 11))
+        self.chat_display.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.chat_display.setLineWrapMode(QTextEdit.WidgetWidth)
+        rl.addWidget(self.chat_display)
+
+        # Input row
+        il = QHBoxLayout()
+        self.input_box = QLineEdit()
+        self.input_box.setPlaceholderText("输入消息，Enter发送 / Shift+Enter换行...")
+        self.input_box.setFont(QFont("Microsoft YaHei", 11))
+        self.input_box.returnPressed.connect(self._send)
+        il.addWidget(self.input_box)
+
+        self.send_btn = QPushButton("发送")
+        self.send_btn.setObjectName("sendBtn")
+        self.send_btn.clicked.connect(self._send)
+        self.send_btn.setFixedWidth(80)
+        il.addWidget(self.send_btn)
+
+        self.stop_btn = QPushButton("停止")
+        self.stop_btn.setObjectName("stopBtn")
+        self.stop_btn.clicked.connect(self._stop)
+        self.stop_btn.setFixedWidth(60)
+        self.stop_btn.hide()
+        il.addWidget(self.stop_btn)
+
+        rl.addLayout(il)
+
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 0)
+        self.progress.hide()
+        rl.addWidget(self.progress)
+
+        ml.addWidget(right)
+
+    def _build_menu(self):
+        mb = self.menuBar()
+        f = mb.addMenu("文件")
+        a = QAction("新对话", self)
+        a.setShortcut(QKeySequence("Ctrl+N"))
+        a.triggered.connect(self._new_session)
+        f.addAction(a)
+
+        a = QAction("导出对话", self)
+        a.setShortcut(QKeySequence("Ctrl+S"))
+        a.triggered.connect(self._export)
+        f.addAction(a)
+
+        f.addSeparator()
+
+        a = QAction("退出登录", self)
+        a.triggered.connect(self._logout)
+        f.addAction(a)
+
+        a = QAction("退出", self)
+        a.setShortcut(QKeySequence("Ctrl+Q"))
+        a.triggered.connect(self.close)
+        f.addAction(a)
+
+        s = mb.addMenu("设置")
+        s.addAction("API & 模型设置...", self._show_settings)
+        s.addSeparator()
+        s.addAction("清除对话数据", self._clear_data)
+
+        h = mb.addMenu("帮助")
+        h.addAction("关于", self._about)
+
+    def _build_statusbar(self):
+        self.sb = QStatusBar()
+        self.setStatusBar(self.sb)
+        self.sb_label = QLabel("就绪 | 设置API Key后开始对话")
+        self.sb.addWidget(self.sb_label)
+        if self.username:
+            self.sb.addPermanentWidget(QLabel(f"👤 {self.username}"))
+
+    def _update_engine_label(self):
+        if HERMES_AVAILABLE:
+            provider = settings.get("provider", "openai")
+            model = settings.get("model", "")
+            self.engine_label.setText(f"引擎: RAIN ✓\n服务商: {provider}\n模型: {model or '未设置'}")
+        else:
+            self.engine_label.setText("引擎: 简化模式\n(RAIN核心未加载)")
+
+    # ── Session ──
+    def _init_db(self):
+        import sqlite3
+        user_dir = SETTINGS_DIR / self.username
+        user_dir.mkdir(parents=True, exist_ok=True)
+        db_path = user_dir / "chat_history.db"
+        self._db = sqlite3.connect(str(db_path), check_same_thread=False)
+        self._db.execute("""CREATE TABLE IF NOT EXISTS sessions (
+            id TEXT PRIMARY KEY, title TEXT, model TEXT, created_at TEXT
+        )""")
+        self._db.execute("""CREATE TABLE IF NOT EXISTS messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT,
+            role TEXT, content TEXT, timestamp TEXT,
+            FOREIGN KEY (session_id) REFERENCES sessions(id)
+        )""")
+        self._db.commit()
+        self._msgs = []  # current session messages in memory
+
+    def _new_session(self):
+        self._save_msgs_to_db()
+        import uuid
+        sid = uuid.uuid4().hex[:12]
+        now = datetime.datetime.now().isoformat()
+        self._db.execute("INSERT INTO sessions VALUES (?,?,?,?)", (sid, "新对话", settings.get("model",""), now))
+        self._db.commit()
+        self.current_sid = sid
+        self._msgs = []
+        self.chat_display.clear()
+        self._append_system("新对话已开始。")
+        self._refresh_sessions()
+
+    def _save_msgs_to_db(self):
+        sid = getattr(self, 'current_sid', None)
+        msgs = getattr(self, '_msgs', [])
+        if not sid or not msgs:
+            return
+        # Clear old, save fresh
+        self._db.execute("DELETE FROM messages WHERE session_id=?", (sid,))
+        now = datetime.datetime.now().isoformat()
+        for role, content in msgs:
+            self._db.execute(
+                "INSERT INTO messages (session_id, role, content, timestamp) VALUES (?,?,?,?)",
+                (sid, role, content, now)
+            )
+        # Update title
+        first = self._db.execute(
+            "SELECT content FROM messages WHERE session_id=? AND role='user' ORDER BY id LIMIT 1", (sid,)
+        ).fetchone()
+        if first:
+            title = first[0][:30].replace("\n", " ")
+            self._db.execute("UPDATE sessions SET title=? WHERE id=?", (title, sid))
+        self._db.commit()
+
+    def _refresh_sessions(self):
+        self.session_list.clear()
+        rows = self._db.execute("SELECT id, title, model, created_at FROM sessions ORDER BY created_at DESC").fetchall()
+        for sid, title, model, created in rows:
+            count = self._db.execute("SELECT COUNT(*) FROM messages WHERE session_id=?", (sid,)).fetchone()[0]
+            text = f"{title[:25]}\n{model or ''} · {count}条"
+            item = QListWidgetItem(text)
+            item.setData(Qt.UserRole, sid)
+            self.session_list.addItem(item)
+
+    def _on_session_click(self, item):
+        sid = item.data(Qt.UserRole)
+        if sid == getattr(self, 'current_sid', None):
+            return
+        self._save_msgs_to_db()
+        self.current_sid = sid
+        self._msgs = []
+        self.chat_display.clear()
+        msgs = self._db.execute(
+            "SELECT role, content FROM messages WHERE session_id=? ORDER BY id", (sid,)
+        ).fetchall()
+        for role, content in msgs:
+            self._msgs.append((role, content))
+            if role == "user":
+                self._append_user(content)
+            else:
+                self._append_ai(self._render_md(content))
+        self._refresh_sessions()
+
+    def _on_session_right_click(self, pos):
+        item = self.session_list.itemAt(pos)
+        if not item:
+            return
+        from PyQt5.QtWidgets import QMenu
+        menu = QMenu(self)
+        del_action = menu.addAction("删除此对话")
+        action = menu.exec_(self.session_list.mapToGlobal(pos))
+        if action == del_action:
+            sid = item.data(Qt.UserRole)
+            self._db.execute("DELETE FROM messages WHERE session_id=?", (sid,))
+            self._db.execute("DELETE FROM sessions WHERE id=?", (sid,))
+            self._db.commit()
+            if sid == getattr(self, 'current_sid', None):
+                self._new_session()
+            else:
+                self._refresh_sessions()
+
+    # ── Send ──
+    def _send(self):
+        text = self.input_box.text().strip()
+        if not text:
+            return
+        if self.worker and self.worker.isRunning():
+            return
+
+        self.input_box.clear()
+        perm_checker.locked_down = False  # reset lockdown for new request
+        self._append_user(text)
+        # Save user message to memory + DB
+        self._msgs.append(("user", text))
+        self._save_msgs_to_db()
+
+        self._response_buffer = ""
+        self._assistant_block_started = False
+
+        self.send_btn.hide()
+        self.stop_btn.show()
+        self.progress.show()
+        self.sb_label.setText("AI思考中...")
+
+        self.worker = RAINWorker(text, history=getattr(self, '_session_msgs', []))
+        # Wire up permission checker
+        perm_checker.request = self.worker.perm_request
+        self.worker.response_chunk.connect(self._on_chunk)
+        self.worker.thinking.connect(self._on_thinking)
+        self.worker.tool_start.connect(self._on_tool_start)
+        self.worker.tool_complete.connect(self._on_tool_complete)
+        self.worker.tool_progress.connect(self._on_tool_progress)
+        self.worker.status_msg.connect(lambda m: self.sb_label.setText(m))
+        self.worker.notice.connect(lambda m: self._append_system(f"📢 {m}"))
+        self.worker.finished.connect(self._on_finished)
+        self.worker.error.connect(self._on_error)
+        self.worker.perm_request.connect(self._on_perm_request)
+        self.worker.start()
+
+    def _on_perm_request(self, tool_name, paths_desc):
+        """Show permission dialog for external file access."""
+        msg = QMessageBox(self)
+        msg.setWindowTitle("权限确认")
+        msg.setIcon(QMessageBox.Warning)
+        msg.setText(f"AI尝试在<b>工作目录外</b>操作文件：\n\n<pre>{paths_desc}</pre>")
+        msg.setInformativeText(f"工具: {tool_name}")
+        btn_this = msg.addButton("此次同意", QMessageBox.AcceptRole)
+        btn_all = msg.addButton("全部同意", QMessageBox.YesRole)
+        btn_deny = msg.addButton("不同意", QMessageBox.RejectRole)
+        msg.setDefaultButton(btn_deny)
+        msg.exec_()
+        clicked = msg.clickedButton()
+        if clicked == btn_all:
+            perm_checker.grant(approve_all=True)
+            self._append_system("🔓 已授权该路径（本次登录不再询问）")
+        elif clicked == btn_this:
+            perm_checker.grant(approve_all=False)
+        else:
+            perm_checker.deny()
+            self._append_system("🚫 已拒绝，已强制停止所有操作")
+            # Hard-stop the worker thread immediately
+            if self.worker and self.worker.isRunning():
+                self.worker.stop()
+                self.worker.terminate()
+                self.worker.wait(1000)
+            self._reset_ui()
+            self.sb_label.setText("操作已拒绝 - 已停止")
+
+    def _stop(self):
+        if self.worker and self.worker.isRunning():
+            self.worker.stop()
+            self.worker.terminate()
+            self.worker.wait(1000)
+        self._reset_ui()
+        self.sb_label.setText("已停止")
+        self._append_system("⏹ 已停止")
+
+    # ── Callbacks ──
+    def _on_chunk(self, text):
+        if not self._assistant_block_started:
+            self._assistant_block_started = True
+            # Save cursor position before streaming bubble (for later replacement)
+            c = self.chat_display.textCursor()
+            c.movePosition(QTextCursor.End)
+            self._stream_start_pos = c.position()
+            self.chat_display.append(
+                '<table align="left" style="margin:6px 0;table-layout:fixed;width:100%;"><tr><td>'
+                '<span style="color:#6c7086; font-size:11px;">RAIN</span></td></tr>'
+                '<tr><td style="background:#1a1a2e; border-radius:12px 12px 12px 4px; padding:10px 14px; word-wrap:break-word; white-space:pre-wrap;">'
+                '<span style="color:#cdd6f4;">'
+            )
+        escaped = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        c = self.chat_display.textCursor()
+        c.movePosition(QTextCursor.End)
+        c.insertHtml(escaped.replace("\n", "<br>"))
+        self._response_buffer += text
+        self._scroll()
+
+    def _render_md(self, text):
+        """Simple markdown to HTML renderer."""
+        import re
+        text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        # Code blocks
+        text = re.sub(r'```(\w*)\n(.*?)```', 
+            r'<pre style="background:#11111b;color:#a6e3a1;padding:10px;border-radius:6px;font-size:12px;white-space:pre-wrap;word-wrap:break-word;">\2</pre>', 
+            text, flags=re.DOTALL)
+        # Inline code
+        text = re.sub(r'`([^`]+?)`', 
+            r'<code style="background:#313244;color:#fab387;padding:1px 5px;border-radius:3px;font-size:12px;">\1</code>', 
+            text)
+        # Bold **...**
+        text = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', text)
+        # Italic *...*
+        text = re.sub(r'(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)', r'<i>\1</i>', text)
+        # Headers
+        text = re.sub(r'^### (.+)$', r'<h4 style="color:#89b4fa;margin:8px 0 4px;">\1</h4>', text, flags=re.MULTILINE)
+        text = re.sub(r'^## (.+)$', r'<h3 style="color:#89b4fa;margin:10px 0 4px;">\1</h3>', text, flags=re.MULTILINE)
+        text = re.sub(r'^# (.+)$', r'<h2 style="color:#89b4fa;margin:12px 0 4px;">\1</h2>', text, flags=re.MULTILINE)
+        # Lists
+        text = re.sub(r'^- (.+)$', r'<li>\1</li>', text, flags=re.MULTILINE)
+        text = re.sub(r'(<li>.*</li>)', r'<ul>\1</ul>', text, flags=re.DOTALL)
+        # Line breaks
+        text = text.replace("\n", "<br>")
+        return text
+
+    def _replace_stream_bubble(self):
+        """Replace the raw-text streaming bubble with rendered markdown."""
+        rendered = self._render_md(self._response_buffer)
+        c = self.chat_display.textCursor()
+        c.setPosition(self._stream_start_pos)
+        c.movePosition(QTextCursor.End, QTextCursor.KeepAnchor)
+        c.removeSelectedText()
+        c.insertHtml(
+            '<table align="left" style="margin:6px 0;max-width:85%;"><tr><td>'
+            '<span style="color:#6c7086; font-size:11px;">RAIN</span></td></tr>'
+            '<tr><td style="background:#1a1a2e; border-radius:12px 12px 12px 4px; padding:10px 14px; word-wrap:break-word; white-space:pre-wrap;">'
+            f'<span style="color:#cdd6f4;">{rendered}</span></td></tr></table>'
+            f'<br clear="all">'
+        )
+        self._scroll()
+
+    def _on_thinking(self, text):
+        escaped = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        self.chat_display.append(
+            f'<div style="color:#6c7086; font-style:italic; font-size:11px; margin:2px 0;">💭 {escaped[:300]}</div>'
+        )
+        self._scroll()
+
+    def _on_tool_start(self, name, args):
+        self.chat_display.append(
+            f'<div style="margin:2px 0; padding:4px 8px; background:#313244; border-radius:4px; border-left:3px solid #fab387;">'
+            f'<span style="color:#fab387;">🔧 {name}</span> '
+            f'<span style="color:#a6adc8; font-size:11px;">{args[:200]}</span></div>'
+        )
+        self._scroll()
+
+    def _on_tool_complete(self, name, result):
+        self.chat_display.append(
+            f'<div style="margin:0 0 4px 12px; padding:4px 8px; background:#1a1a2e; border-radius:4px; font-size:11px;">'
+            f'<span style="color:#a6adc8;">结果: {result[:500]}</span></div>'
+        )
+        self._scroll()
+
+    def _on_tool_progress(self, name, status):
+        self.sb_label.setText(f"🔧 {name}: {status[:80]}")
+
+    def _on_finished(self, response, meta):
+        # Save AI response
+        if response and response.strip():
+            self._msgs.append(("assistant", response))
+            self._save_msgs_to_db()
+        # Replace streaming raw text with rendered markdown
+        if response and response.strip() and hasattr(self, '_stream_start_pos'):
+            self._replace_stream_bubble()
+        self._reset_ui()
+        self.sb_label.setText("就绪")
+        self._update_engine_label()
+        self._refresh_sessions()
+
+    def _on_error(self, msg):
+        self.chat_display.append(
+            f'<div style="color:#f38ba8; padding:4px 8px; background:#2e1e1e; border-radius:4px;">'
+            f'❌ {msg[:1000]}</div>'
+        )
+        self._reset_ui()
+        self.sb_label.setText("错误")
+
+    def _reset_ui(self):
+        self.send_btn.show()
+        self.stop_btn.hide()
+        self.progress.hide()
+        self._assistant_block_started = False
+        self.worker = None
+
+    # ── Display helpers ──
+    def _append_system(self, text):
+        self.chat_display.append(f'<div style="color:#a6adc8; font-style:italic; margin:4px 0;">{text}</div>')
+
+    def _append_user(self, text):
+        escaped = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\n", "<br>")
+        name = self.username or "用户"
+        self.chat_display.append(
+            f'<table align="right" style="margin:6px 0;max-width:85%;"><tr><td align="right">'
+            f'<span style="color:#6c7086; font-size:11px;">{name}</span></td></tr>'
+            f'<tr><td style="background:#313244; border-radius:12px 12px 4px 12px; padding:10px 14px; word-wrap:break-word; white-space:pre-wrap;">'
+            f'<span style="color:#cdd6f4;">{escaped}</span></td></tr></table>'
+            f'<br clear="all">'
+        )
+
+    def _append_ai(self, html_content):
+        self.chat_display.append(
+            f'<table align="left" style="margin:6px 0;max-width:85%;"><tr><td>'
+            f'<span style="color:#6c7086; font-size:11px;">RAIN</span></td></tr>'
+            f'<tr><td style="background:#1a1a2e; border-radius:12px 12px 12px 4px; padding:10px 14px; word-wrap:break-word; white-space:pre-wrap;">'
+            f'<span style="color:#cdd6f4;">{html_content}</span></td></tr></table>'
+            f'<br clear="all">'
+        )
+
+    def _scroll(self):
+        if settings.get("auto_scroll"):
+            c = self.chat_display.textCursor()
+            c.movePosition(QTextCursor.End)
+            self.chat_display.setTextCursor(c)
+
+    # ── Actions ──
+    def _show_settings(self):
+        dlg = SettingsDialog(self)
+        if dlg.exec_():
+            self._update_engine_label()
+            self._append_system("设置已更新。")
+
+    def _export(self):
+        path, _ = QFileDialog.getSaveFileName(self, "导出对话", "chat.html", "HTML (*.html)")
+        if path:
+            Path(path).write_text(
+                f"<html><head><meta charset='utf-8'></head><body>{self.chat_display.toHtml()}</body></html>",
+                encoding="utf-8"
+            )
+
+    def _clear_data(self):
+        r = QMessageBox.question(self, "确认", "确定要清除所有对话数据吗？此操作不可恢复。",
+                                 QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if r == QMessageBox.Yes:
+            self._save_msgs_to_db()
+            # 清空数据库
+            self._db.execute("DELETE FROM messages")
+            self._db.execute("DELETE FROM sessions")
+            self._db.commit()
+            self._msgs = []
+            self.current_sid = None
+            self.chat_display.clear()
+            self.session_list.clear()
+            self._new_session()
+            self._append_system("🗑️ 所有对话数据已清除")
+
+    def _about(self):
+        engine = "RAIN Agent 完整引擎 ✓" if HERMES_AVAILABLE else f"简化引擎 ({_hermes_import_error[:50]}...)"
+        QMessageBox.about(self, f"关于 {APP_NAME}",
+            f"<b>{APP_NAME} v{APP_VERSION}</b><br><br>"
+            f"基于RAIN Agent的完整 Windows 桌面版。<br>"
+            f"引擎状态: {engine}<br><br>"
+            f"功能: AI对话 · 工具调用 · 代码执行 · 文件操作 · 网页浏览<br>"
+            f"技能系统 · 多服务商支持 · 流式响应 · 思考过程"
+        )
+
+    def _logout(self):
+        self._save_msgs_to_db()
+        # 清除记住的登录
+        remember_file = SETTINGS_DIR / "remember.json"
+        try:
+            remember_file.unlink(missing_ok=True)
+        except Exception:
+            pass
+        settings.save()
+        QApplication.quit()
+
+    def closeEvent(self, e):
+        self._save_msgs_to_db()
+        settings.set("window_x", self.x())
+        settings.set("window_y", self.y())
+        settings.set("window_w", self.width())
+        settings.set("window_h", self.height())
+        super().closeEvent(e)
+
+
+# ── Main ────────────────────────────────────────────────────
+def main():
+    app = QApplication(sys.argv)
+    app.setApplicationName(APP_NAME)
+    app.setStyle("Fusion")
+    app.setStyleSheet(DARK_STYLE)
+
+    # Check for remembered login
+    remember_file = SETTINGS_DIR / "remember.json"
+    auto_login = False
+    username = ""
+
+    if remember_file.exists():
+        try:
+            data = json.loads(remember_file.read_text(encoding="utf-8"))
+            remembered_user = data.get("user", "")
+            remembered_pass = data.get("pass_hash", "")
+            if remembered_user and remembered_pass:
+                import sqlite3
+                dbp = SETTINGS_DIR / "users.db"
+                if dbp.exists():
+                    db = sqlite3.connect(str(dbp))
+                    row = db.execute("SELECT password FROM users WHERE username=?",
+                                   (remembered_user,)).fetchone()
+                    db.close()
+                    if row and row[0] == remembered_pass:
+                        auto_login = True
+                        username = remembered_user
+        except Exception:
+            pass
+
+    if not auto_login:
+        dlg = LoginDialog()
+        if dlg.exec_() != QDialog.Accepted:
+            sys.exit(0)
+        username = dlg.username
+
+    # Switch settings to this user (isolation per account)
+    settings.switch_user(username)
+    perm_checker.reset()   # clear external-path approvals from previous user
+
+    win = MainWindow(username)
+    win.show()
+
+    if not HERMES_AVAILABLE:
+        win._append_system(f"⚠️ RAIN引擎未加载: {_hermes_import_error}")
+        win._append_system("将使用OpenAI SDK简易模式。请确保已安装依赖: pip install -r requirements_full.txt")
+
+    sys.exit(app.exec_())
+
+
+if __name__ == "__main__":
+    main()
