@@ -52,7 +52,7 @@ build.bat
 build.bat  :: 选择 Y 创建安装包
 ```
 
-安装包: `HermesDesktop_Setup.exe`，百度网盘：https://pan.baidu.com/s/1PBztlPmRCz38coHy-AAOJA?pwd=rpp6 提取码: rpp6
+安装包: `RAIN_Setup.exe`，百度网盘：https://pan.baidu.com/s/1PBztlPmRCz38coHy-AAOJA?pwd=rpp6 提取码: rpp6
 
 ## 设置
 
