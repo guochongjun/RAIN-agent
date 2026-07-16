@@ -74,7 +74,7 @@ build.bat  :: 选择 Y 创建安装包
 ## 文件结构
 
 ```
-win_desktop/
+RAIN-agent/
 ├── RAIN_desktop.py    # 主程序
 ├── requirements.txt     # Python 依赖
 ├── build.bat           # 一键构建脚本
