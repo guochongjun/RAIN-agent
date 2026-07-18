@@ -45,7 +45,7 @@ python RAIN_desktop.py
 build.bat
 ```
 
-生成的 EXE 在 `dist\HermesDesktop\HermesDesktop.exe`，直接双击运行。
+生成的 EXE，直接双击运行。
 
 ### 方式三：创建安装包
 
@@ -54,7 +54,7 @@ build.bat
 build.bat  :: 选择 Y 创建安装包
 ```
 
-安装包: `RAIN_Setup.exe`，百度网盘：https://pan.baidu.com/s/1PBztlPmRCz38coHy-AAOJA?pwd=rpp6 提取码: rpp6
+安装包: `RAIN_Setup_V2.exe`，百度网盘：https://pan.baidu.com/s/1PBztlPmRCz38coHy-AAOJA?pwd=rpp6 提取码: rpp6
 
 ## 设置
 
@@ -86,6 +86,6 @@ RAIN-agent/
 └── icon.ico            # 应用图标
 ```
 
-## 联系方式
+## 联系方式(江西磐拓智能科技有限公司)
 
 QQ：258129316
