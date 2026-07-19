@@ -124,10 +124,6 @@ win_desktop/
 ├── build_all.ps1            # 全量+增量一键构建（动态扫描skills）
 ├── hotfix.nsi               # 增量热修复（File /r 递归复制skills）
 ├── installer.nsi            # 全量安装包
-├── dist/                    # 构建产物
-│   ├── RAIN.exe             #   启动器
-│   ├── hermes-agent.7z      #   Hermes引擎+技能
-│   └── python.7z            #   Python运行环境
 ├── vendor/                  # 工具链（7z、Git Bash、FFmpeg）
 └── icon.ico                 # 应用图标
 ```
